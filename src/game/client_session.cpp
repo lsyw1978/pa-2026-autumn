@@ -13,6 +13,7 @@ ClientSession::ClientSession(std::string name, std::istream& in,
 
 ClientSession::~ClientSession() = default;
 
+
 // ---------------------------------------------------------------------------
 // 传输初始化。这一段是框架的一部分：房间路径推导与连接、非阻塞设置都由
 // listen_room()/connect_tcp() 完成，你不需要改动。
@@ -57,10 +58,12 @@ bool ClientSession::send_to_host(Message message) {
     return true;
 }
 
+
 // ---------------------------------------------------------------------------
 // 事件钩子：这些是你要实现的部分。
 // ---------------------------------------------------------------------------
-// 1. 客户端连接成功后，向 Host 发送包含玩家名称的 JOIN 请求
+
+// 客户端连接成功后，向 Host 发送包含玩家名称的 JOIN 请求
 void ClientSession::on_connected() {            // 
     Message join_request("JOIN");               // 创建 JOIN 消息
     join_request.set("name", session_name());   // 设置玩家名称
@@ -112,9 +115,29 @@ void ClientSession::on_peer_message(PeerId, const Message& message) {
     // Other message types will be implemented later
 }
 
-void ClientSession::on_peer_leave(PeerId) {
-    info("TODO(client): the host went away -- report it and return to the lobby");
+// Handle losing the connection to the Host
+void ClientSession::on_peer_leave(PeerId who) {
+
+    // Ignore disconnections unrelated to the Host
+    if (who != m_host) {
+        return;
+    }
+
+    // Report the lost connection
+    error("Disconnected from the Host");
+
+    // Clear the Host connection
+    m_host = PeerId{};
+
+    // Clear the client's local player information
+    m_seat = -1;
+    m_player_name.clear();
+    m_players.clear();
+
+    // Return to the lobby if currently in a game
+    return_to_lobby();
 }
+
 
 // ---------------------------------------------------------------------------
 // 命令 -> 协议消息：协议由框架固定，这里已经写好，你不需要改动。

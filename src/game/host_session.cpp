@@ -85,7 +85,6 @@ void HostSession::broadcast_players() {
 }
 
 
-
 // ---------------------------------------------------------------------------
 // 事件钩子：这些是你要实现的部分。
 // ---------------------------------------------------------------------------
@@ -150,11 +149,74 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
 
         return;
     }
+
+    
+    // Handle a client's request to change their name
+    if (message.type == "RENAME") {
+
+        // Only allow renaming while in the lobby
+        if (phase() != Phase::Lobby) {
+            send_to(from, Message("ERROR").set("msg", "Cannot rename during a game"));
+            return;
+        }
+
+        // Find the seat associated with this connection
+        auto it = m_peer_seats.find(from);
+
+        // Reject requests from clients who have not joined
+        if (it == m_peer_seats.end()) {
+            send_to(from, Message("ERROR").set("msg", "Player not found"));
+            return;
+        }
+
+        // Get the requested new name
+        std::string new_name = message.get("name");
+
+        // Reject empty names
+        if (new_name.empty()) {
+            send_to(from, Message("ERROR").set("msg", "Name cannot be empty"));
+            return;
+        }
+
+        // Check whether another player already uses this name
+        for (const auto& [seat, player] : m_players) {
+            if (seat != it->second && player.name == new_name) {
+                send_to(from, Message("ERROR").set("msg", "Name already taken"));
+                return;
+            }
+        }
+
+        // Update the player's name
+        m_players.at(it->second).name = new_name;
+
+        // Notify all clients of the updated player list
+        broadcast_players();
+
+        return;
+    }
+
 }
 
+// Remove a disconnected player and update the player list
 void HostSession::on_peer_leave(PeerId who) {
-    info("TODO(host): peer " + who.str() +
-         " disconnected -- drop it from the player list");
+
+    // Find the disconnected player's seat
+    auto it = m_peer_seats.find(who);
+
+    // Ignore connections that never joined
+    if (it == m_peer_seats.end()) {
+        return;
+    }
+
+    // Get the player's seat number
+    int seat = it->second;
+
+    // Remove the player from both maps
+    m_players.erase(seat);
+    m_peer_seats.erase(it);
+
+    // Notify the remaining clients
+    broadcast_players();
 }
 
 
@@ -181,13 +243,72 @@ Session::Result HostSession::start(const Args&) {
     return Result::StartGame;
 }
 
+// Remove a client from the lobby using their seat number or name
 Session::Result HostSession::kick(const Args& args) {
-    info("TODO(host): remove player " + args[1] + " and broadcast PLAYERS");
+
+    // Get the player identifier from the command
+    std::string target = args[1];
+    int target_seat = -1;
+
+    // First, look for a matching seat number
+    for (const auto& [seat, player] : m_players) {
+        if (seat != 0 && std::to_string(seat) == target) {
+            target_seat = seat;
+            break;
+        }
+    }
+
+    // If no seat matches, look for a matching player name
+    if (target_seat == -1) {
+        for (const auto& [seat, player] : m_players) {
+            if (seat != 0 && player.name == target) {
+                target_seat = seat;
+                break;
+            }
+        }
+    }
+
+    // Reject invalid player identifiers
+    if (target_seat == -1) {
+        error("Player not found or cannot be kicked");
+        return Result::Continue;
+    }
+
+    // Find the connection associated with the selected player
+    PeerId peer = m_players.at(target_seat).peer;
+
+    // Disconnect the player and trigger on_peer_leave()
+    loop().close_peer(peer);
+
     return Result::Continue;
 }
 
+// Rename the Host and notify all connected clients
 Session::Result HostSession::rename(const Args& args) {
-    info("TODO(host): rename player to " + args[1] + " and broadcast PLAYERS");
+
+    // Get the new name from the command
+    std::string new_name = args[1];
+
+    // Reject empty names
+    if (new_name.empty()) {
+        error("Name cannot be empty");
+        return Result::Continue;
+    }
+
+    // Check whether another player already uses this name
+    for (const auto& [seat, player] : m_players) {
+        if (seat != 0 && player.name == new_name) {
+            error("Name already taken");
+            return Result::Continue;
+        }
+    }
+
+    // Update the Host's name in the player list
+    m_players.at(0).name = new_name;
+
+    // Notify all clients of the updated player list
+    broadcast_players();
+
     return Result::Continue;
 }
 

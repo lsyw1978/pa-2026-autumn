@@ -4,17 +4,27 @@
 
 namespace uno {
 
+// HostSession constructor：initializes the session with the host role and sets up lobby commands
 HostSession::HostSession(std::string name, std::istream& in, std::ostream& out)
     : Session(Role::Host, std::move(name), in, out) {
+
+    // Register the host as player 0
+    m_players.emplace(0, Player{session_name(), PeerId{}});
+
+    // Register the "start" command, which calls start() to begin the game
     add_lobby_command("start", "start",
                       "start the game and deal the cards (host only)",
                       [this](const Args& args) { return start(args); });
+
+    // Register the "kick" command, which calls kick() to remove a player
     add_lobby_command("kick", "kick <player_id|player_name>",
                       "remove a player from the room (host only)",
                       [this](const Args& args) { return kick(args); }, 1, 1);
 }
 
+// HostSession destructor: default implementation
 HostSession::~HostSession() = default;
+
 
 // ---------------------------------------------------------------------------
 // 传输初始化。这段是框架的一部分：房间路径推导、残留 socket 清理、权限、
@@ -42,16 +52,104 @@ bool HostSession::listen_tcp(int port, std::string& err) {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+// Find the first available client seat (seat 0 belongs to the host)
+int HostSession::next_available_seat() const {
+    int seat = 1;
+
+    while (m_players.contains(seat)) {
+        ++seat;
+    }
+
+    return seat;
+}
+
+ // Send current player list to all connected players
+void HostSession::broadcast_players() {
+    Message players_message("PLAYERS");
+
+    // Set the total number of players
+    players_message.set("count", static_cast<int>(m_players.size()));
+
+    // Add each player's seat number and name
+    for (const auto& [seat, player] : m_players) {
+        players_message.set(std::to_string(seat), player.name);
+    }
+
+    // Send the updated player list to all clients
+    broadcast(std::move(players_message));
+}
+
+
+
 // ---------------------------------------------------------------------------
 // 事件钩子：这些是你要实现的部分。
 // ---------------------------------------------------------------------------
+
+// Wait for the client's JOIN message before registering the player
 void HostSession::on_peer_join(PeerId who) {
-    info("TODO(host): a client connected as peer " + who.str() +
-         " -- greet it, ask for a name, and update the player list");
+    (void)who;
 }
 
+// Handle messages received from connected players
 void HostSession::on_peer_message(PeerId from, const Message& message) {
-    info("TODO(host): handle " + message.type + " from peer " + from.str());
+    
+    // Handle the JOIN message from a client
+    if (message.type == "JOIN") {
+
+        // Get the player's name from the message
+        std::string player_name = message.get("name");
+
+        // Reject empty names
+        if (player_name.empty()) {
+            error("JOIN requires a name");
+            return;
+        }
+
+        // Check if the player name is already taken
+        for (const auto& [seat, player] : m_players) {
+            if (player.name == player_name) {
+                send_to(from, Message("ERROR").set("msg", "name already taken"));
+                return;
+            }
+        }
+
+        // Prevent the same connection from joining twice
+        if (m_peer_seats.contains(from)) {
+            send_to(from, Message("ERROR").set("msg", "Client has already joined"));
+            return;
+        }
+
+        // Only accept new players while in the lobby
+        if (phase() != Phase::Lobby) {
+            send_to(from, Message("ERROR").set("msg", "Cannot join after the game has started"));
+            return;
+        }
+
+        // Find an available seat for the new player
+        int seat = next_available_seat();
+
+        // Add the new player to the player list
+        m_players.emplace(seat, Player{player_name, from});
+
+        // Map the player's connection to their seat number
+        m_peer_seats.emplace(from, seat);
+
+        // Send the assigned seat number and name to the new player
+        Message welcome_message("WELCOME");
+        welcome_message.set("id", seat);
+        welcome_message.set("name", player_name);
+        send_to(from, std::move(welcome_message));
+
+        // Send the updated player list to all clients
+        broadcast_players();
+
+        return;
+    }
 }
 
 void HostSession::on_peer_leave(PeerId who) {
@@ -59,12 +157,26 @@ void HostSession::on_peer_leave(PeerId who) {
          " disconnected -- drop it from the player list");
 }
 
+
 // ---------------------------------------------------------------------------
 // 本地命令行：host 玩家自己敲的命令。
 // ---------------------------------------------------------------------------
+   
+ // Start the game only when >=2 players are present
 Session::Result HostSession::start(const Args&) {
-    info("TODO(host): validate >=2 players, deal cards, send HAND to each "
-         "player and START/TURN to everyone");
+
+    // Check whether there are enough players to start
+    if (m_players.size() < 2) {
+        error("At least two players are required to start");
+        return Result::Continue;
+    }
+
+    // Notify all connected clients that the game has started
+    broadcast(Message("START"));
+
+    // Switch the Host from lobby mode to game mode
+    enter_game();
+
     // 骨架行为：即使游戏逻辑还没写，也让大厅 -> 游戏 -> 大厅的流程可走通。
     return Result::StartGame;
 }

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <map>
 
 #include "game/session.h"
 #include "protocol/net.h"
@@ -54,6 +55,15 @@ protected:
 
 private:
     PeerId m_host;
+
+    // Store the client's assigned seat number
+    int m_seat = -1;
+
+    // Store the name confirmed by the Host
+    std::string m_player_name;
+
+    // Store the latest player list received from the Host
+    std::map<int, std::string> m_players;
 };
 
 } // 命名空间 uno

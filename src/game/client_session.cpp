@@ -60,8 +60,11 @@ bool ClientSession::send_to_host(Message message) {
 // ---------------------------------------------------------------------------
 // 事件钩子：这些是你要实现的部分。
 // ---------------------------------------------------------------------------
-void ClientSession::on_connected() {
-    info("TODO(client): send JOIN name=" + session_name());
+// 1. 客户端连接成功后，向 Host 发送包含玩家名称的 JOIN 请求
+void ClientSession::on_connected() {            // 
+    Message join_request("JOIN");               // 创建 JOIN 消息
+    join_request.set("name", session_name());   // 设置玩家名称
+    send_to_host(std::move(join_request));      // 向 Host 发送 JOIN 请求
 }
 
 void ClientSession::on_peer_join(PeerId) {
@@ -69,8 +72,44 @@ void ClientSession::on_peer_join(PeerId) {
     // 这里不会发生什么。
 }
 
+// Update the client's local information when receiving Host messages
 void ClientSession::on_peer_message(PeerId, const Message& message) {
-    info("TODO(client): update the local view from " + message.type);
+
+    // Handle the WELCOME message
+    if (message.type == "WELCOME") {
+
+        // Save the seat number and name assigned by the Host
+        m_seat = message.get_int("id");
+        m_player_name = message.get("name");
+
+        return;
+    }
+
+    // Handle the updated player list
+    if (message.type == "PLAYERS") {
+
+        // Clear the previous player list
+        m_players.clear();
+
+        // Store each player's seat number and name
+        for (const auto& [key, name] : message.fields) {
+            if (key == "count") {
+                continue;
+            }
+
+            int seat = std::stoi(key);
+            m_players.emplace(seat, name);
+        }
+
+        return;
+    }
+
+    // The Session framework already handles the START phase transition
+    if (message.type == "START") {
+        return;
+    }
+
+    // Other message types will be implemented later
 }
 
 void ClientSession::on_peer_leave(PeerId) {

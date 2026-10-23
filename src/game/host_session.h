@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <map>
 
 #include "game/session.h"
 #include "protocol/net.h"
@@ -23,10 +24,10 @@ namespace uno {
 // 与游戏规则相关的工作先用 info("TODO(host): ...") 标记，你在对应函数里
 // 替换成真正的实现。
 // ---------------------------------------------------------------------------
-class HostSession : public Session {
+class HostSession : public Session {        // HostSession 继承自 Session
 public:
     explicit HostSession(std::string name, std::istream& in = std::cin,
-                         std::ostream& out = std::cout);
+                        std::ostream& out = std::cout);
     ~HostSession() override;
 
     // 本地房间：在 <运行时目录>/uno/<room>.sock 上监听，客户端用 --join=<room>
@@ -61,6 +62,24 @@ protected:
 private:
     std::unique_ptr<Server> m_server;
     std::string m_room_path;
+
+    // Store each player's name & network connection (PeerId)
+    struct Player {
+        std::string name;
+        PeerId peer;
+    };
+
+    // Store players by seat number
+    std::map<int, Player> m_players;
+
+    // Map network connections to seat numbers
+    std::map<PeerId, int> m_peer_seats;
+
+    // Find the next available seat number for a new player
+    int next_available_seat() const;
+
+    // Send the updated player list to all connected clients
+    void broadcast_players();
 };
 
 } // 命名空间 uno

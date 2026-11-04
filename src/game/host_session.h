@@ -4,6 +4,8 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <cstddef>
+#include <vector>
 
 #include "game/session.h"
 #include "protocol/net.h"
@@ -60,10 +62,12 @@ protected:
     Result swap(const Args& args) override;
 
 private:
+    // 1. NETWORK MANAGEMENT
     std::unique_ptr<Server> m_server;
     std::string m_room_path;
 
-    // Store each player's name & network connection (PeerId)
+    // 2. PLAYER MANAGEMENT
+    // Player info (name + network connection)
     struct Player {
         std::string name;
         PeerId peer;
@@ -80,6 +84,20 @@ private:
 
     // Send the updated player list to all connected clients
     void broadcast_players();
+
+    // 3. DECK MANAGEMENT
+    // Create standard 108-card UNO deck
+    void create_deck();
+
+    // Shuffle deck using configured random seed
+    void shuffle_deck();
+
+    // Store the cards in the deck
+    std::vector<std::string> m_deck;
+
+    // Track the index of the next card to draw
+    std::size_t m_next_card = 0;
+
 };
 
 } // 命名空间 uno

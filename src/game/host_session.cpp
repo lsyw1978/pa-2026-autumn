@@ -1,8 +1,17 @@
 #include "host_session.h"
 
 #include <utility>
+#include <algorithm>
+#include <random>
+#include <cstdint>
+
+using namespace std;
 
 namespace uno {
+
+// ============================================================================
+// 1. CONSTRUCTOR AND SETUP
+// ============================================================================
 
 // HostSession constructor：initializes the session with the host role and sets up lobby commands
 HostSession::HostSession(std::string name, std::istream& in, std::ostream& out)
@@ -25,6 +34,10 @@ HostSession::HostSession(std::string name, std::istream& in, std::ostream& out)
 // HostSession destructor: default implementation
 HostSession::~HostSession() = default;
 
+
+// ============================================================================
+// 2. NETWORK AND CONNECTION MANAGEMENT
+// ============================================================================
 
 // ---------------------------------------------------------------------------
 // 传输初始化。这段是框架的一部分：房间路径推导、残留 socket 清理、权限、
@@ -52,6 +65,10 @@ bool HostSession::listen_tcp(int port, std::string& err) {
     return true;
 }
 
+
+// ============================================================================
+// 3. PLAYER MANAGEMENT
+// ============================================================================
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -85,9 +102,9 @@ void HostSession::broadcast_players() {
 }
 
 
-// ---------------------------------------------------------------------------
-// 事件钩子：这些是你要实现的部分。
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 4. DECK MANAGEMENT
+// ============================================================================
 
 // Wait for the client's JOIN message before registering the player
 void HostSession::on_peer_join(PeerId who) {
@@ -219,10 +236,65 @@ void HostSession::on_peer_leave(PeerId who) {
     broadcast_players();
 }
 
+// Create a standard 108-card UNO deck
+void HostSession::create_deck() {
+    m_deck.clear();
+    m_deck.reserve(108);
 
-// ---------------------------------------------------------------------------
-// 本地命令行：host 玩家自己敲的命令。
-// ---------------------------------------------------------------------------
+    // Create number & action cards for each color
+    for (char color : {'R', 'Y', 'G', 'B'}) {
+        string prefix(1, color);
+
+        // Add 1 zero card
+        m_deck.push_back(prefix + "0");
+
+        // Add 2 of each number card (1-9)
+        for (int num = 1; num <= 9; ++num) {
+            string card = prefix + to_string(num);
+            m_deck.push_back(card);
+            m_deck.push_back(card);
+        }
+
+        // Add 2 of each action card (skip, reverse, draw two)
+        for (const char* action : {"SK", "RV", "D2"}) {
+            string card = prefix + action;
+            m_deck.push_back(card);
+            m_deck.push_back(card);
+        }
+    }
+
+    // Add 4 Wild cards
+    for (int i = 0; i < 4; ++i) {
+        m_deck.push_back("W");
+    }
+
+    // Add 4 Wild Draw Four cards
+    for (int i = 0; i < 4; ++i) {
+        m_deck.push_back("W4");
+    }
+}
+
+// Shuffle the deck using the configured random seed
+void HostSession::shuffle_deck() {
+    // Use provided seed or generate random seed if none given
+    uint32_t actual_seed;
+    if (has_seed()) {
+        actual_seed = seed();
+    } else {
+        actual_seed = random_device{}();
+    }
+
+    // Initialize random number generator with actual seed
+    mt19937 gen(actual_seed);
+
+    // Shuffle the cards in the deck
+    shuffle(m_deck.begin(), m_deck.end(), gen);
+}
+
+
+// ============================================================================
+// 5. GAME INITIALIZATION
+// ============================================================================
    
  // Start the game only when >=2 players are present
 Session::Result HostSession::start(const Args&) {
@@ -232,6 +304,25 @@ Session::Result HostSession::start(const Args&) {
         error("At least two players are required to start");
         return Result::Continue;
     }
+
+    // Initialize deck for new game
+    if (has_deck_override()) {
+        // Use specified deck without shuffling
+        m_deck = deck_override();
+    } else {
+        // Create and shuffle standard UNO deck
+        create_deck();
+        shuffle_deck();
+    }
+
+    // Check that there are enough cards for all players + 1 starting card
+    if (m_deck.size() < m_players.size() * 7 + 1) {
+        error("Not enough cards to start the game");
+        return Result::Continue;
+    }
+
+    // Reset deck position to 1st card for new game
+    m_next_card = 0;
 
     // Notify all connected clients that the game has started
     broadcast(Message("START"));
@@ -312,6 +403,11 @@ Session::Result HostSession::rename(const Args& args) {
     return Result::Continue;
 }
 
+
+// ============================================================================
+// 6. GAMEPLAY AND TURN MANAGEMENT
+// ============================================================================
+
 Session::Result HostSession::play(const Args& args) {
     info("TODO(host): validate and play " + args[1] +
          ", then send HAND/PLAYED/TURN");
@@ -332,6 +428,11 @@ Session::Result HostSession::pass(const Args&) {
     info("TODO(host): finish the draw turn and advance the current player");
     return Result::Continue;
 }
+
+
+// ============================================================================
+// 7. ADVANCED RULES (STAGE 3)
+// ============================================================================
 
 Session::Result HostSession::uno(const Args& args) {
     info(args.size() > 1 ? "TODO(host): resolve a forgotten-UNO report"

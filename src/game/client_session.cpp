@@ -70,9 +70,11 @@ void ClientSession::on_connected() {            //
     send_to_host(std::move(join_request));      // 向 Host 发送 JOIN 请求
 }
 
+// Handle a new peer connection
 void ClientSession::on_peer_join(PeerId) {
     // 客户端只有一个对端，框架在 join_room()/connect_tcp() 里已经登记好，
     // 这里不会发生什么。
+    // The Host connection is already established by the framework
 }
 
 // Update the client's local information when receiving Host messages
@@ -112,7 +114,26 @@ void ClientSession::on_peer_message(PeerId, const Message& message) {
         return;
     }
 
-    // Other message types will be implemented later
+    // Update the client's cached hand
+    if (message.type == "HAND") {
+        m_hand_cards = message.get("cards");
+        return;
+    }
+
+    // Update the current turn & face-up card
+    if (message.type == "TURN") {
+    m_current_seat = message.get_int("player", -1);
+    m_top_card = message.get("top");
+    return;
+    }
+
+    // Clear game information when a round ends
+    if (message.type == "GAMEOVER" || message.type == "ABORTED") {
+        m_hand_cards.clear();
+        m_current_seat = -1;
+        m_top_card.clear();
+        return;
+    }
 }
 
 // Handle losing the connection to the Host
@@ -133,6 +154,11 @@ void ClientSession::on_peer_leave(PeerId who) {
     m_seat = -1;
     m_player_name.clear();
     m_players.clear();
+
+    // Clear cached game information
+    m_hand_cards.clear();
+    m_current_seat = -1;
+    m_top_card.clear();
 
     // Return to the lobby if currently in a game
     return_to_lobby();
@@ -157,8 +183,16 @@ Session::Result ClientSession::play(const Args& args) {
     return Result::Continue;
 }
 
+// Display the Client's cached hand
 Session::Result ClientSession::cards(const Args&) {
-    info("TODO(client): print the hand cached from the last HAND message");
+    // Create a HAND message using the cached cards
+    Message hand("HAND");
+    hand.set("cards", m_hand_cards);
+
+    // Display the hand in the Client terminal
+    out() << hand.serialize() << '\n';
+    out().flush();
+
     return Result::Continue;
 }
 

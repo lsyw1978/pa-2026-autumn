@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <random>
 #include <cstdint>
+#include <cctype>
 
 using namespace std;
 
@@ -18,7 +19,7 @@ HostSession::HostSession(std::string name, std::istream& in, std::ostream& out)
     : Session(Role::Host, std::move(name), in, out) {
 
     // Register the host as player 0
-    m_players.emplace(0, Player{session_name(), PeerId{}});
+    m_players.emplace(0, Player{session_name(), PeerId{}, {}});
 
     // Register the "start" command, which calls start() to begin the game
     add_lobby_command("start", "start",
@@ -70,10 +71,6 @@ bool HostSession::listen_tcp(int port, std::string& err) {
 // 3. PLAYER MANAGEMENT
 // ============================================================================
 
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
-
 // Find the first available client seat (seat 0 belongs to the host)
 int HostSession::next_available_seat() const {
     int seat = 1;
@@ -111,10 +108,10 @@ void HostSession::on_peer_join(PeerId who) {
     (void)who;
 }
 
-// Handle messages received from connected players
+// Handle messages received from connected clients
 void HostSession::on_peer_message(PeerId from, const Message& message) {
     
-    // Handle the JOIN message from a client
+    // Handle JOIN message from a client
     if (message.type == "JOIN") {
 
         // Get the player's name from the message
@@ -150,7 +147,7 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
         int seat = next_available_seat();
 
         // Add the new player to the player list
-        m_players.emplace(seat, Player{player_name, from});
+        m_players.emplace(seat, Player{player_name, from, {}});
 
         // Map the player's connection to their seat number
         m_peer_seats.emplace(from, seat);
@@ -166,9 +163,8 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
 
         return;
     }
-
     
-    // Handle a client's request to change their name
+    // Handle RENAME request from a player
     if (message.type == "RENAME") {
 
         // Only allow renaming while in the lobby
@@ -212,6 +208,88 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
         return;
     }
 
+    // Handle PLAY request from a player
+    if (message.type == "PLAY") {
+        auto it = m_peer_seats.find(from);
+
+        if (it == m_peer_seats.end()) {
+            send_to(from, Message("ERROR").set("msg", "Player not found"));
+            return;
+        }
+
+        // Get the player's seat number
+        int seat = it->second;
+
+        // Reject attempts to play before game starts
+        if (phase() != Phase::Game) {
+            send_player_error(seat, "Game has not started");
+            return;
+        }
+
+        // Check that a card was specified
+        string card = message.get("cards");
+        if (card.empty()) {
+            send_player_error(seat, "PLAY requires a card");
+            return;
+        }
+
+        // Get the optional Wild color
+        string color = message.get("color");
+
+        // Validate & process the client's play
+        play_card(seat, card, color);
+
+        return;
+    }
+
+    // Handle DRAW request from a player
+    if (message.type == "DRAW") {
+        auto it = m_peer_seats.find(from);
+
+        if (it != m_peer_seats.end()) {
+            take_card(it->second);
+        }
+
+        return;
+    }
+
+    // Handle PASS request from a player
+    if (message.type == "PASS") {
+        auto it = m_peer_seats.find(from);
+
+        if (it != m_peer_seats.end()) {
+            finish_draw_turn(it->second);
+        }
+
+        return;
+    }
+
+    // Handle UNO declaration from a player
+    if (message.type == "UNO") {
+        auto it = m_peer_seats.find(from);
+
+        if (it == m_peer_seats.end()) {
+            send_to(from, Message("ERROR").set("msg", "Player not found"));
+            return;
+        }
+
+        int seat = it->second;
+
+        if (phase() != Phase::Game) {
+            send_player_error(seat, "Game has not started");
+            return;
+        }
+
+        // Reporting another player is handled separately
+        if (message.has("player")) {
+            send_player_error(seat, "UNO reporting is not implemented yet");
+            return;
+        }
+
+        // Validate the player's UNO declaration
+        handle_uno(seat);
+        return;
+    }
 }
 
 // Remove a disconnected player and update the player list
@@ -321,11 +399,92 @@ Session::Result HostSession::start(const Args&) {
         return Result::Continue;
     }
 
-    // Reset deck position to 1st card for new game
+    // Reset deck position to 1st card
     m_next_card = 0;
+
+    // Deal 7 cards to each player
+    deal_cards();
+
+    // Reveal the starting card
+    m_top_card = m_deck[m_next_card];
+    ++m_next_card;
+
+    // Initialize turn order for a new game
+    m_current_player = 0;
+    m_direction = 1;
+
+    // Reset game state for a new game
+    m_active_color.clear();
+    m_pending_draw = 0;
+    m_has_drawn = false;
+    m_drawn_card.clear();
+
+    // Apply starting card's special effect
+    if (m_top_card == "W" || m_top_card == "W4") {
+        // Handle wild card effects
+        if (m_top_card == "W") {
+            // Wild card -> Host goes 1st
+            m_current_player = 0;
+
+        } else if (m_top_card == "W4") {
+            // Wild draw four -> Host draws 4 cards
+            for (int i = 0; i < 4; ++i) {
+                m_players.at(0).hand.push_back(m_deck[m_next_card]);
+                ++m_next_card;
+            }
+
+            // Skip Host & select next occupied seat
+            auto next = m_players.upper_bound(0); // Find next player
+            if (next == m_players.end()) {        // Handle wraparound
+                next = m_players.begin();
+            }
+            m_current_player = next->first;
+        }
+    } else if (m_top_card.size() > 1) {
+        // Handle colored action cards (i.e. skip, reverse, draw two)
+        string action = m_top_card.substr(1);
+
+        if (action == "SK") {
+            // Skip Host & select next occupied seat
+            auto next = m_players.upper_bound(0); // Find next player
+            if (next == m_players.end()) {        // Handle wraparound
+                next = m_players.begin();
+            }
+            m_current_player = next->first;       // Update current player
+
+        } else if (action == "RV") {
+            // Reverse initial turn direction
+            m_direction = -1;
+
+            // Select last occupied seat as 1st player
+            m_current_player = m_players.rbegin()->first;
+
+        } else if (action == "D2") {
+            // Make the Host draw 2 cards
+            for (int i = 0; i < 2; ++i) {
+                m_players.at(0).hand.push_back(m_deck[m_next_card]);
+                ++m_next_card;
+            }
+
+            // Skip Host & select next occupied seat
+            auto next = m_players.upper_bound(0); // Find next player
+            if (next == m_players.end()) {        // Handle wraparound
+                next = m_players.begin();
+            }
+            m_current_player = next->first;
+        }
+    }
+
+    // Send each player their updated private hand
+    for (const auto& entry : m_players) {
+        send_hand(entry.first);
+    }
 
     // Notify all connected clients that the game has started
     broadcast(Message("START"));
+
+    // Broadcast the initial turn & starting card
+    broadcast_turn();
 
     // Switch the Host from lobby mode to game mode
     enter_game();
@@ -403,30 +562,505 @@ Session::Result HostSession::rename(const Args& args) {
     return Result::Continue;
 }
 
+// Deal 7 cards to each player according to seat order
+void HostSession::deal_cards() {
+    for (auto& [seat, player] : m_players) {
+        // Clear any cards remaining from previous game
+        player.hand.clear();
+
+        // Consecutively deal 7 cards to current player
+        for (int i = 0; i < 7; ++i) {
+            player.hand.push_back(m_deck[m_next_card]);
+            ++m_next_card;
+        }
+    }
+}
+
+// Privately send a player their current hand
+void HostSession::send_hand(int seat) {
+    const Player& player = m_players.at(seat);
+
+    // Combine player's cards into comma-separated string
+    std::string cards;
+    for (size_t i = 0; i < player.hand.size(); ++i) {
+        if (i > 0) {
+            cards += ", ";
+        }
+        cards += player.hand[i];
+    }
+
+    // Create HAND message
+    Message message("HAND");
+    message.set("cards", cards);
+
+    // Display Host's hand locally or send a Client's hand privately
+    if (seat == 0) {
+        out() << message.serialize() << '\n';
+    } else {
+        send_to(player.peer, message);
+    }
+}
+
+// Convert a Wild color to its one-letter representation
+static string normalize_wild_color(string color) {
+    // Convert input to lowercase
+    transform(color.begin(), color.end(), color.begin(),
+              [](unsigned char c) { return static_cast<char>(tolower(c)); });
+
+    if (color == "red" || color == "r") return "R";
+    if (color == "yellow" || color == "y") return "Y";
+    if (color == "green" || color == "g") return "G";
+    if (color == "blue" || color == "b") return "B";
+
+    // Return empty string for invalid colors
+    return "";
+}
+
+// Calculate the point value of a card
+static int card_points(const string& card) {
+    // Wild cards are worth 50 points
+    if (card == "W" || card == "W4") {
+        return 50;
+    }
+
+    string face = card.substr(1);
+
+    // Action cards are worth 20 points
+    if (face == "SK" || face == "RV" || face == "D2") {
+        return 20;
+    }
+
+    // Number cards are worth their face value
+    return stoi(face);
+}
+
+// Validate & process a player's card
+bool HostSession::play_card(int seat, const string& card, const string& chosen_color) {
+    // 1. Verify it's the player's turn
+    if (seat != m_current_player) {
+        send_player_error(seat, "Not your turn");
+        return false;
+    }
+
+    // 2. Only allow one card per play in Stage 2
+    if (card.empty() || card.find(',') != string::npos) {
+        send_player_error(seat, "Invalid card");
+        return false;
+    }
+
+    // 3. Verify that the player owns the card
+    auto& hand = m_players.at(seat).hand;
+    auto it = find(hand.begin(), hand.end(), card);
+    if (it == hand.end()) {
+        send_player_error(seat, "Card is not in your hand");
+        return false;
+    }
+
+    // 4. Check whether the card is a Wild
+    bool is_wild = (card == "W" || card == "W4");
+    string color = normalize_wild_color(chosen_color);
+
+    // Wild cards require a valid color
+    if (is_wild && color.empty()) {
+        send_player_error(seat, "Wild card requires a valid color");
+        return false;
+    }
+
+    // Regular cards cannot specify a new color
+    if (!is_wild && !chosen_color.empty()) {
+        send_player_error(seat, "Only Wild cards can specify a color");
+        return false;
+    }
+
+    // 5. Determine the effective color of the face-up card
+    string current_color = m_active_color;
+
+    if (current_color.empty() && m_top_card != "W" && m_top_card != "W4") {
+        current_color = m_top_card.substr(0,1);
+    }
+
+    // 6. Check whether a regular card matches color or face
+    if (!is_wild) {
+        string card_color = card.substr(0,1);
+        string card_face = card.substr(1);
+
+        bool matches_color = (card_color == current_color);
+        bool matches_face = false;
+
+        if (m_top_card != "W" && m_top_card != "W4") {
+            matches_face = (card_face == m_top_card.substr(1));
+        }
+
+        if (!matches_color && !matches_face) {
+            send_player_error(seat, "Card must match color or face");
+            return false;
+        }
+    }
+
+    // Only allow the newly drawn card to be played after drawing
+    if (m_has_drawn && card != m_drawn_card) {
+        send_player_error(seat, "Only the newly drawn card can be played");
+        return false;
+    }
+
+    // Resolve pending draw penalties before playing another card
+    if (m_pending_draw > 0) {
+        send_player_error(seat, "Must resolve the draw penalty");
+        return false;
+    }
+
+    // Remove played card from player's hand
+    hand.erase(it);
+
+    // Send player their updated private hand
+    send_hand(seat);
+
+    // Update face-up card & effective color
+    m_top_card = card;
+    if (is_wild) {
+        // Wild card -> chosen color
+        m_active_color = color;
+    } else {
+        // Regular card -> printed color
+        m_active_color = card.substr(0,1);
+    }
+
+    // Reset drawing state after successful play
+    m_has_drawn = false;
+    m_drawn_card.clear();
+
+    // Announce the successful play
+    Message played("PLAYED");
+    played.set("player", seat);
+    played.set("cards", card);
+
+    if (is_wild) {
+        played.set("color", chosen_color);
+    }
+
+    // Display the play locally & notify all clients
+    out() << played.serialize() << '\n';
+    out().flush();
+    broadcast(move(played));
+
+    // End the game if the player has no cards remaining
+    if (hand.empty()) {
+        finish_game(seat);
+        return true;
+    }
+
+    // Identify the played card's effect
+    string face = is_wild ? card : card.substr(1);
+
+    if (face == "SK") {
+        // Skip next player
+        m_current_player = next_seat(seat, 2);
+
+    } else if (face == "RV") {
+        // Reverse direction, in a 2-player game Reverse = Skip
+        if (m_players.size() == 2) {
+            m_current_player = next_seat(seat, 2);
+        } else {
+            m_direction = -m_direction;
+            m_current_player = next_seat(seat);
+        }
+
+    } else {
+        // Advance to the next player
+        m_current_player = next_seat(seat);
+
+        // Set the number of penalty cards the next player must draw
+        if (face == "D2") {
+            m_pending_draw = 2;
+        } else if (face == "W4") {
+            m_pending_draw = 4;
+        }
+    }
+
+    // Broadcast the updated turn
+    broadcast_turn();
+
+    return true;
+}
+
 
 // ============================================================================
 // 6. GAMEPLAY AND TURN MANAGEMENT
 // ============================================================================
 
+// Broadcast the current turn & face-up card
+void HostSession::broadcast_turn() {
+    // Create TURN message
+    Message turn("TURN");
+
+    // Specify the current player & face-up card
+    turn.set("player", m_current_player);
+    turn.set("top", m_top_card);
+
+    // Include current turn direction
+    turn.set("direction", m_direction);
+
+    // Include pending penalty cards
+    if (m_pending_draw > 0) {
+        turn.set("pending", m_pending_draw);
+    }
+
+    // Display turn info in Host terminal
+    out() << turn.serialize() << '\n';
+    out().flush();
+
+    // Notify all connected clients
+    broadcast(move(turn));
+}
+
+// Find the next occupied set in the current turn direction
+int HostSession::next_seat(int seat, int steps) const {
+    auto it = m_players.find(seat); // Locate current player
+
+    if (it == m_players.end()) {    // Check whether seat exists
+        return seat;
+    }
+
+    for (int i = 0; i < steps; ++i) {
+        if (m_direction == 1) {
+            // Move forward to next player
+             ++it;
+            if (it == m_players.end()) {    // Handle wraparound
+                it = m_players.begin();
+            }
+        } else {
+            // Move backward to previous player
+            if (it == m_players.begin()) {  // Handle wraparound
+                it = m_players.end();
+            }
+            --it;
+        }
+    }
+
+    return it->first;   // Return selected player's seat
+}
+
+// Send error message to player that attempts invalid action
+void HostSession::send_player_error(int seat, const string& reason) {
+    if (seat == 0) {
+        // Display error in Host terminal
+        error(reason);
+    } else {
+        // Send error message privately to the player
+        Message err("ERROR");
+        err.set("msg", reason);
+        send_to(m_players.at(seat).peer, move(err));
+    }
+}
+
+// Handle PLAY command from the Host
 Session::Result HostSession::play(const Args& args) {
-    info("TODO(host): validate and play " + args[1] +
-         ", then send HAND/PLAYED/TURN");
+    // Get the card to play
+    string card = args[1];
+
+    // Get chosen color if playing Wild card
+    string color;
+    if (args.size() > 2) {
+        color = args[2];
+    } else {
+        color = "";
+    }
+
+    // Validate & process the Host's play
+    play_card(0, card, color);
+
     return Result::Continue;
 }
 
+// Handle DRAW command from a player
+bool HostSession::take_card(int seat) {
+    // Verify that it's the player's turn
+    if (seat != m_current_player) {
+        send_player_error(seat, "Not your turn");
+        return false;
+    }
+
+    // Handle a pending D2 or W4 penalty
+    if (m_pending_draw > 0) {
+        int count  = m_pending_draw;
+        m_pending_draw = 0;
+
+        // Draw the required number of cards
+        int drawn = 0;
+        for (int i = 0; i < count && m_next_card < m_deck.size(); ++i) {
+            m_players.at(seat).hand.push_back(m_deck[m_next_card]);
+            ++m_next_card;
+            ++drawn;
+        }
+
+        // Announce the number of cards drawn
+        Message drawn_message("DRAWN");
+        drawn_message.set("player", seat);
+        drawn_message.set("count", drawn);
+        broadcast(move(drawn_message));
+
+        // Update player's private hand
+        send_hand(seat);
+
+        // End penalized player's turn;
+        m_has_drawn = false;
+        m_drawn_card.clear();
+        m_current_player = next_seat(seat);
+        broadcast_turn();
+
+        return true;
+    }
+
+    // Prevent drawing more than once per turn
+    if (m_has_drawn) {
+        send_player_error(seat, "Already drew a card this turn");
+        return false;
+    }
+
+    // Check whether deck has any cards remaining
+    if (m_next_card >= m_deck.size()) {
+        send_player_error(seat, "No cards left in draw pile");
+        return false;
+    }
+
+    // Draw one card
+    string card = m_deck[m_next_card];
+    ++m_next_card;
+    m_players.at(seat).hand.push_back(card);
+
+    // Remember the newly drawn card
+    m_has_drawn = true;
+    m_drawn_card = card;
+
+    // Announce draw without revealing card
+    Message drawn_message("DRAWN");
+    drawn_message.set("player", seat);
+    drawn_message.set("count", 1);
+    broadcast(move(drawn_message));
+
+    // Send updated hand privately
+    send_hand(seat);
+    broadcast_turn();
+
+    return true;
+}
+
+// Handle PASS command from a player
+bool HostSession::finish_draw_turn(int seat) {
+    // Verify that it is the player's turn
+    if (seat != m_current_player) {
+        send_player_error(seat, "Not your turn");
+        return false;
+    }
+
+    // Players can only pass after voluntarily drawing a card
+    if (!m_has_drawn || m_pending_draw > 0) {
+        send_player_error(seat, "Can only pass after drawing");
+        return false;
+    }
+
+    // Reset drawing state & advance to next player
+    m_has_drawn = false;
+    m_drawn_card.clear();
+    m_current_player = next_seat(seat);
+
+    // Announce the next turn
+    broadcast_turn();
+
+    return true;
+}
+
+// Display the Host's current hand
 Session::Result HostSession::cards(const Args&) {
-    info("TODO(host): print the authoritative hand of this player");
+    // Display the Host's hand locally
+    send_hand(0);
+
     return Result::Continue;
 }
 
+// Handle DRAW command from the Host
 Session::Result HostSession::draw(const Args&) {
-    info("TODO(host): draw one card, decide playability, update the turn");
+    take_card(0);
     return Result::Continue;
 }
 
+// Handle PASS command from the Host
 Session::Result HostSession::pass(const Args&) {
-    info("TODO(host): finish the draw turn and advance the current player");
+    finish_draw_turn(0);
     return Result::Continue;
+}
+
+// Handle UNO declaration from a player
+void HostSession::handle_uno(int seat) {
+    // Check whether the player has exactly 1 card
+    if (m_players.at(seat).hand.size() == 1) {
+        // Announce valid UNO declaration
+        Message uno_message("UNO");
+        uno_message.set("player", seat);
+
+        out() << uno_message.serialize() << '\n';
+        out().flush();
+
+        broadcast(move(uno_message));
+
+    } else {
+        // Penalize an incorrect UNO declaration
+        Message penalty("UNOPENALTY");
+        penalty.set("player", seat);
+        penalty.set("count", 2);
+
+        out() << penalty.serialize() << '\n';
+        out().flush();
+
+        broadcast(move(penalty));
+
+        // Make the player draw 2 penalty cards
+        for (int i = 0; i < 2 && m_next_card < m_deck.size(); ++i) {
+            m_players.at(seat).hand.push_back(m_deck[m_next_card]);
+           ++m_next_card;
+        }
+
+        // Send updated hand privately
+        send_hand(seat);
+    }
+}
+
+ // Calculate the winner's score and end the game
+void HostSession::finish_game(int winner) {
+    // Calculate the total points of the losing players' cards
+    int points = 0;
+
+    for (const auto& [seat, player] : m_players) {
+        // Skip the winning player
+        if (seat == winner) {
+            continue;
+        }
+
+        // Add the point values of the remaining cards
+        for (const string& card : player.hand) {
+            points += card_points(card);
+        }
+    }
+
+    // Create GAMEOVER message
+    Message gameover("GAMEOVER");
+    gameover.set("winner", winner);
+    gameover.set("points", points);
+
+    // Display the result in the Host terminal
+    out() << gameover.serialize() << '\n';
+    out().flush();
+
+    // Notify all connected clients
+    broadcast(move(gameover));
+
+    // Reset game state
+    m_pending_draw = 0;
+    m_has_drawn = false;
+    m_drawn_card.clear();
+
+    // Return the Host to the lobby
+    return_to_lobby();
 }
 
 
@@ -434,9 +1068,15 @@ Session::Result HostSession::pass(const Args&) {
 // 7. ADVANCED RULES (STAGE 3)
 // ============================================================================
 
+// Handle UNO command from the Host
 Session::Result HostSession::uno(const Args& args) {
-    info(args.size() > 1 ? "TODO(host): resolve a forgotten-UNO report"
-                         : "TODO(host): record this player's UNO call");
+    if (args.size() > 1) {
+        error("UNO reporting is not implemented yet");
+        return Result::Continue;
+    }
+
+    handle_uno(0);
+
     return Result::Continue;
 }
 

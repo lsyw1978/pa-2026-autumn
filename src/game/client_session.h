@@ -64,6 +64,15 @@ private:
 
     // Store the latest player list received from the Host
     std::map<int, std::string> m_players;
+
+    // Cache the latest hand received from the Host
+    std::string m_hand_cards;
+
+    // Track the current player's seat number
+    int m_current_seat = -1;
+
+    // Store the current face-up card
+    std::string m_top_card;
 };
 
 } // 命名空间 uno

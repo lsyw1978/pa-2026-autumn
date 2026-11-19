@@ -6,6 +6,7 @@
 #include <map>
 #include <cstddef>
 #include <vector>
+#include <random>
 
 #include "game/session.h"
 #include "protocol/net.h"
@@ -103,6 +104,14 @@ private:
 
     // Track the index of the next card to draw
     std::size_t m_next_card = 0;
+    // Cards in the discard pile, in order. The last is the visible top card.
+    std::vector<std::string> m_discard;
+    std::mt19937 m_rng;
+    bool draw_one(int seat);
+    int draw_many(int seat, int count);
+    void announce_draw(int seat, int count);
+    void announce_penalty(int seat);
+
 
 
     // 4. GAME INITIALIZATION
@@ -128,6 +137,20 @@ private:
 
     // Track the number of penalty cards the next player must draw
     int m_pending_draw = 0;
+    bool m_chain_has_d2 = false;
+    enum class WaitState { None, Challenge, Swap };
+    WaitState m_waiting = WaitState::None;
+    int m_waiting_player = -1;  // challenged player or the owner of the 7
+    int m_w4_player = -1;
+    bool m_w4_illegal = false;
+    int m_uno_vulnerable = -1;
+    void close_uno_window();
+    void update_uno_window_after_play(int seat);
+    bool resolve_challenge(int seat, const std::string& accept);
+    bool resolve_swap(int seat, const std::string& target);
+    bool report_uno(int seat, const std::string& target);
+    void cycle_hands();
+
 
     // Find next player based on turn direction
     int next_seat(int seat, int steps = 1) const;

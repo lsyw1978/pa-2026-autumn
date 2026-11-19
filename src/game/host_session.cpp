@@ -5,6 +5,7 @@
 #include <random>
 #include <cstdint>
 #include <cctype>
+#include <sstream>
 
 using namespace std;
 
@@ -280,9 +281,8 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
             return;
         }
 
-        // Reporting another player is handled separately
         if (message.has("player")) {
-            send_player_error(seat, "UNO reporting is not implemented yet");
+            report_uno(seat, message.get("player"));
             return;
         }
 
@@ -290,6 +290,27 @@ void HostSession::on_peer_message(PeerId from, const Message& message) {
         handle_uno(seat);
         return;
     }
+
+    if (message.type == "CHALLENGE" || message.type == "SWAP") {
+        auto it = m_peer_seats.find(from);
+        if (it == m_peer_seats.end()) {
+            send_to(from, Message("ERROR").set("msg", "Player not found"));
+            return;
+        }
+        if (phase() != Phase::Game) {
+            send_player_error(it->second, "Game has not started");
+            return;
+        }
+        if (message.type == "CHALLENGE") {
+            resolve_challenge(it->second, message.get("accept"));
+        } else {
+            resolve_swap(it->second, message.get("player"));
+        }
+        return;
+    }
+
+    // Unknown messages and malformed protocol requests must not change state.
+    send_to(from, Message("ERROR").set("msg", "Unknown or invalid request"));
 }
 
 // Remove a disconnected player and update the player list
@@ -362,11 +383,9 @@ void HostSession::shuffle_deck() {
         actual_seed = random_device{}();
     }
 
-    // Initialize random number generator with actual seed
-    mt19937 gen(actual_seed);
-
-    // Shuffle the cards in the deck
-    shuffle(m_deck.begin(), m_deck.end(), gen);
+    // Reuse this generator to shuffle the discard pile when the draw pile empties.
+    m_rng.seed(actual_seed);
+    shuffle(m_deck.begin(), m_deck.end(), m_rng);
 }
 
 
@@ -374,7 +393,7 @@ void HostSession::shuffle_deck() {
 // 5. GAME INITIALIZATION
 // ============================================================================
    
- // Start the game only when >=2 players are present
+// Start the game only when >=2 players are present
 Session::Result HostSession::start(const Args&) {
 
     // Check whether there are enough players to start
@@ -385,8 +404,9 @@ Session::Result HostSession::start(const Args&) {
 
     // Initialize deck for new game
     if (has_deck_override()) {
-        // Use specified deck without shuffling
+        // Use specified deck without shuffling; later reshuffles are deterministic.
         m_deck = deck_override();
+        m_rng.seed(has_seed() ? seed() : 0);
     } else {
         // Create and shuffle standard UNO deck
         create_deck();
@@ -409,6 +429,9 @@ Session::Result HostSession::start(const Args&) {
     m_top_card = m_deck[m_next_card];
     ++m_next_card;
 
+    m_discard.clear();
+    m_discard.push_back(m_top_card);
+
     // Initialize turn order for a new game
     m_current_player = 0;
     m_direction = 1;
@@ -416,6 +439,12 @@ Session::Result HostSession::start(const Args&) {
     // Reset game state for a new game
     m_active_color.clear();
     m_pending_draw = 0;
+    m_chain_has_d2 = false;
+    m_waiting = WaitState::None;
+    m_waiting_player = -1;
+    m_w4_player = -1;
+    m_w4_illegal = false;
+    m_uno_vulnerable = -1;
     m_has_drawn = false;
     m_drawn_card.clear();
 
@@ -428,10 +457,7 @@ Session::Result HostSession::start(const Args&) {
 
         } else if (m_top_card == "W4") {
             // Wild draw four -> Host draws 4 cards
-            for (int i = 0; i < 4; ++i) {
-                m_players.at(0).hand.push_back(m_deck[m_next_card]);
-                ++m_next_card;
-            }
+            draw_many(0, 4);
 
             // Skip Host & select next occupied seat
             auto next = m_players.upper_bound(0); // Find next player
@@ -461,10 +487,7 @@ Session::Result HostSession::start(const Args&) {
 
         } else if (action == "D2") {
             // Make the Host draw 2 cards
-            for (int i = 0; i < 2; ++i) {
-                m_players.at(0).hand.push_back(m_deck[m_next_card]);
-                ++m_next_card;
-            }
+            draw_many(0, 2);
 
             // Skip Host & select next occupied seat
             auto next = m_players.upper_bound(0); // Find next player
@@ -634,155 +657,219 @@ static int card_points(const string& card) {
     return stoi(face);
 }
 
-// Validate & process a player's card
-bool HostSession::play_card(int seat, const string& card, const string& chosen_color) {
-    // 1. Verify it's the player's turn
+// Remove whitespace around individual card names while preserving their order.
+static vector<string> parse_play_cards(const string& text) {
+    vector<string> result;
+    string value;
+    istringstream in(text);
+    while (getline(in, value, ',')) {
+        value.erase(remove_if(value.begin(), value.end(),
+                   [](unsigned char c) { return isspace(c); }), value.end());
+        if (value.empty()) return {};
+        result.push_back(value);
+    }
+    if (text.empty() || text.back() == ',') return {};
+    return result;
+}
+
+// Validate an entire play before mutating any game state.
+bool HostSession::play_card(int seat, const string& card_text,
+                            const string& chosen_color) {
+    if (m_waiting != WaitState::None) {
+        send_player_error(seat, "Resolve the pending challenge or swap first");
+        return false;
+    }
     if (seat != m_current_player) {
         send_player_error(seat, "Not your turn");
         return false;
     }
-
-    // 2. Only allow one card per play in Stage 2
-    if (card.empty() || card.find(',') != string::npos) {
-        send_player_error(seat, "Invalid card");
+    const auto cards = parse_play_cards(card_text);
+    if (cards.empty()) {
+        send_player_error(seat, "Invalid card list");
         return false;
     }
 
-    // 3. Verify that the player owns the card
     auto& hand = m_players.at(seat).hand;
-    auto it = find(hand.begin(), hand.end(), card);
-    if (it == hand.end()) {
-        send_player_error(seat, "Card is not in your hand");
-        return false;
-    }
-
-    // 4. Check whether the card is a Wild
-    bool is_wild = (card == "W" || card == "W4");
-    string color = normalize_wild_color(chosen_color);
-
-    // Wild cards require a valid color
-    if (is_wild && color.empty()) {
-        send_player_error(seat, "Wild card requires a valid color");
-        return false;
-    }
-
-    // Regular cards cannot specify a new color
-    if (!is_wild && !chosen_color.empty()) {
-        send_player_error(seat, "Only Wild cards can specify a color");
-        return false;
-    }
-
-    // 5. Determine the effective color of the face-up card
-    string current_color = m_active_color;
-
-    if (current_color.empty() && m_top_card != "W" && m_top_card != "W4") {
-        current_color = m_top_card.substr(0,1);
-    }
-
-    // 6. Check whether a regular card matches color or face
-    if (!is_wild) {
-        string card_color = card.substr(0,1);
-        string card_face = card.substr(1);
-
-        bool matches_color = (card_color == current_color);
-        bool matches_face = false;
-
-        if (m_top_card != "W" && m_top_card != "W4") {
-            matches_face = (card_face == m_top_card.substr(1));
+    auto remaining = hand;
+    for (const auto& card : cards) {
+        auto it = find(remaining.begin(), remaining.end(), card);
+        if (it == remaining.end()) {
+            send_player_error(seat, "Card is not in your hand");
+            return false;
         }
+        remaining.erase(it);
+    }
+    if (cards.size() > 1 && remaining.empty()) {
+        send_player_error(seat, "The last card must be played alone");
+        return false;
+    }
 
-        if (!matches_color && !matches_face) {
+    const bool wild = (cards[0] == "W" || cards[0] == "W4");
+    const string selected = normalize_wild_color(chosen_color);
+    if (!chosen_color.empty() && selected.empty()) {
+        send_player_error(seat, "Invalid color");
+        return false;
+    }
+
+    bool mixed_colors = false;
+    bool multi_skip = false;
+    if (cards.size() > 1) {
+        // Legal multi-card combinations: equal colored numbers, at least three
+        // equal numbers of differing colors, or same-colored Skip cards.
+        if (wild) {
+            send_player_error(seat, "Wild cards cannot be played together");
+            return false;
+        }
+        const string face = cards[0].substr(1);
+        const char color = cards[0][0];
+        const bool numeric = face.size() == 1 && isdigit(static_cast<unsigned char>(face[0]));
+        multi_skip = (face == "SK");
+        if (!numeric && !multi_skip) {
+            send_player_error(seat, "Invalid multiple-card combination");
+            return false;
+        }
+        for (const auto& card : cards) {
+            if (card.size() < 2 || card.substr(1) != face ||
+                card == "W" || card == "W4") {
+                send_player_error(seat, "Multiple cards must have the same face");
+                return false;
+            }
+            if (card[0] != color) mixed_colors = true;
+        }
+        if ((mixed_colors && (cards.size() < 3 || multi_skip)) ||
+            (mixed_colors && selected.empty())) {
+            send_player_error(seat, "Mixed-color numbers require at least 3 cards and a color");
+            return false;
+        }
+    }
+    if ((wild && selected.empty()) ||
+        (!wild && !mixed_colors && !chosen_color.empty())) {
+        send_player_error(seat, "Invalid color selection");
+        return false;
+    }
+
+    const string current_color = m_active_color.empty() &&
+            m_top_card != "W" && m_top_card != "W4"
+            ? m_top_card.substr(0, 1) : m_active_color;
+
+    if (m_pending_draw > 0) {
+        // Matching is waived when a player is stacking a penalty card.
+        // D2 -> D2 or W4; W4 -> W4 only if a D2 started the chain.
+        const bool can_stack = cards.size() == 1 &&
+            ((m_top_card.size() >= 2 && m_top_card.substr(1) == "D2" &&
+              ((cards[0].size() >= 2 && cards[0].substr(1) == "D2") || cards[0] == "W4")) ||
+             (m_top_card == "W4" && cards[0] == "W4" && m_chain_has_d2));
+        if (!can_stack) {
+            send_player_error(seat, "Must stack a permitted penalty card or draw");
+            return false;
+        }
+    } else if (!wild) {
+        bool matches_color = cards[0].substr(0, 1) == current_color;
+        bool matches_face = m_top_card != "W" && m_top_card != "W4" &&
+                            cards[0].substr(1) == m_top_card.substr(1);
+        // An initial Wild has no selected color; the first player may set it
+        // by playing an ordinary card of any color.
+        if (!matches_color && !matches_face && !current_color.empty()) {
             send_player_error(seat, "Card must match color or face");
             return false;
         }
     }
-
-    // Only allow the newly drawn card to be played after drawing
-    if (m_has_drawn && card != m_drawn_card) {
+    if (m_has_drawn && (cards.size() != 1 || cards[0] != m_drawn_card)) {
         send_player_error(seat, "Only the newly drawn card can be played");
         return false;
     }
 
-    // Resolve pending draw penalties before playing another card
-    if (m_pending_draw > 0) {
-        send_player_error(seat, "Must resolve the draw penalty");
-        return false;
+    // Compute W4 legality using the previous effective color and the cards
+    // remaining after playing W4, not its newly chosen color.
+    bool illegal_w4 = false;
+    if (cards[0] == "W4" && m_pending_draw == 0) {
+        for (const auto& other : remaining) {
+            if (other != "W" && other != "W4" &&
+                other.substr(0, 1) == current_color) {
+                illegal_w4 = true;
+                break;
+            }
+        }
     }
 
-    // Remove played card from player's hand
-    hand.erase(it);
-
-    // Send player their updated private hand
-    send_hand(seat);
-
-    // Update face-up card & effective color
-    m_top_card = card;
-    if (is_wild) {
-        // Wild card -> chosen color
-        m_active_color = color;
-    } else {
-        // Regular card -> printed color
-        m_active_color = card.substr(0,1);
-    }
-
-    // Reset drawing state after successful play
+    close_uno_window();
+    hand = move(remaining);
+    for (const auto& card : cards) m_discard.push_back(card);
+    m_top_card = cards.back();
+    m_active_color = (wild || mixed_colors) ? selected : cards.back().substr(0, 1);
     m_has_drawn = false;
     m_drawn_card.clear();
 
-    // Announce the successful play
+    send_hand(seat);
     Message played("PLAYED");
-    played.set("player", seat);
-    played.set("cards", card);
-
-    if (is_wild) {
-        played.set("color", chosen_color);
-    }
-
-    // Display the play locally & notify all clients
+    played.set("player", seat).set("cards", card_text);
+    if (wild || mixed_colors) played.set("color", chosen_color);
     out() << played.serialize() << '\n';
     out().flush();
     broadcast(move(played));
 
-    // End the game if the player has no cards remaining
+    // Finishing with a 0 or 7 wins immediately, before any swaps take place.
     if (hand.empty()) {
         finish_game(seat);
         return true;
     }
+    update_uno_window_after_play(seat);
 
-    // Identify the played card's effect
-    string face = is_wild ? card : card.substr(1);
-
-    if (face == "SK") {
-        // Skip next player
-        m_current_player = next_seat(seat, 2);
-
-    } else if (face == "RV") {
-        // Reverse direction, in a 2-player game Reverse = Skip
-        if (m_players.size() == 2) {
-            m_current_player = next_seat(seat, 2);
-        } else {
-            m_direction = -m_direction;
+    if (cards.size() == 1 && m_top_card == "W4") {
+        if (m_pending_draw > 0) {
+            m_pending_draw += 4;
             m_current_player = next_seat(seat);
-        }
-
-    } else {
-        // Advance to the next player
-        m_current_player = next_seat(seat);
-
-        // Set the number of penalty cards the next player must draw
-        if (face == "D2") {
-            m_pending_draw = 2;
-        } else if (face == "W4") {
+            broadcast_turn();
+        } else {
             m_pending_draw = 4;
+            m_w4_player = seat;
+            m_w4_illegal = illegal_w4;
+            m_waiting = WaitState::Challenge;
+            m_waiting_player = next_seat(seat);
+            m_current_player = m_waiting_player;
+            Message request("CHALLENGE");
+            request.set("player", m_waiting_player).set("ask", "w4")
+                   .set("cards", 4).set("color", chosen_color);
+            out() << request.serialize() << '\n';
+            out().flush();
+            broadcast(move(request));
         }
+        return true;
     }
 
-    // Broadcast the updated turn
-    broadcast_turn();
+    const string face = cards[0].substr(1);
+    if (face == "D2") {
+        m_pending_draw += 2;
+        m_chain_has_d2 = true;
+        m_current_player = next_seat(seat);
+    } else if (face == "SK") {
+        m_current_player = next_seat(seat, static_cast<int>(cards.size()) + 1);
+    } else if (face == "RV") {
+        if (m_players.size() == 2)
+            m_current_player = seat;
+        else {
+            m_direction *= -1;
+            m_current_player = next_seat(seat);
+        }
+    } else {
+        m_current_player = next_seat(seat);
+    }
 
+    // A 0 cycles every hand in the current direction and is not a waiting state.
+    if (cards.size() == 1 && face == "0") cycle_hands();
+    if (cards.size() == 1 && face == "7") {
+        m_waiting = WaitState::Swap;
+        m_waiting_player = seat;
+        Message ask("SWAP");
+        ask.set("player", seat).set("waiting", "yes");
+        out() << ask.serialize() << '\n';
+        out().flush();
+        broadcast(move(ask));
+        return true;
+    }
+    broadcast_turn();
     return true;
 }
-
 
 // ============================================================================
 // 6. GAMEPLAY AND TURN MANAGEMENT
@@ -872,81 +959,80 @@ Session::Result HostSession::play(const Args& args) {
     return Result::Continue;
 }
 
-// Handle DRAW command from a player
+// Draw from the pile, recycling previous discards but keeping the top card.
+bool HostSession::draw_one(int seat) {
+    if (m_next_card >= m_deck.size()) {
+        if (m_discard.size() <= 1) return false;
+        // Recycling does not include the visible top card.
+        string current = m_discard.back();
+        m_deck.assign(m_discard.begin(), m_discard.end() - 1);
+        m_discard.assign(1, current);
+        shuffle(m_deck.begin(), m_deck.end(), m_rng);
+        m_next_card = 0;
+    }
+    m_players.at(seat).hand.push_back(m_deck[m_next_card++]);
+    return true;
+}
+
+int HostSession::draw_many(int seat, int count) {
+    int actual = 0;
+    while (actual < count && draw_one(seat)) ++actual;
+    return actual;
+}
+
+void HostSession::announce_draw(int seat, int count) {
+    Message message("DRAWN");
+    message.set("player", seat).set("count", count);
+    out() << message.serialize() << '\n';
+    out().flush();
+    broadcast(move(message));
+    send_hand(seat);
+}
+
 bool HostSession::take_card(int seat) {
-    // Verify that it's the player's turn
+    if (m_waiting != WaitState::None) {
+        send_player_error(seat, "Resolve the challenge or swap first");
+        return false;
+    }
     if (seat != m_current_player) {
         send_player_error(seat, "Not your turn");
         return false;
     }
-
-    // Handle a pending D2 or W4 penalty
     if (m_pending_draw > 0) {
-        int count  = m_pending_draw;
+        const int count = m_pending_draw;
         m_pending_draw = 0;
-
-        // Draw the required number of cards
-        int drawn = 0;
-        for (int i = 0; i < count && m_next_card < m_deck.size(); ++i) {
-            m_players.at(seat).hand.push_back(m_deck[m_next_card]);
-            ++m_next_card;
-            ++drawn;
-        }
-
-        // Announce the number of cards drawn
-        Message drawn_message("DRAWN");
-        drawn_message.set("player", seat);
-        drawn_message.set("count", drawn);
-        broadcast(move(drawn_message));
-
-        // Update player's private hand
-        send_hand(seat);
-
-        // End penalized player's turn;
+        m_chain_has_d2 = false;
+        close_uno_window();
+        const int actual = draw_many(seat, count);
+        announce_draw(seat, actual);
         m_has_drawn = false;
         m_drawn_card.clear();
         m_current_player = next_seat(seat);
         broadcast_turn();
-
         return true;
     }
-
-    // Prevent drawing more than once per turn
     if (m_has_drawn) {
         send_player_error(seat, "Already drew a card this turn");
         return false;
     }
-
-    // Check whether deck has any cards remaining
-    if (m_next_card >= m_deck.size()) {
+    if (!draw_one(seat)) {
         send_player_error(seat, "No cards left in draw pile");
         return false;
     }
-
-    // Draw one card
-    string card = m_deck[m_next_card];
-    ++m_next_card;
-    m_players.at(seat).hand.push_back(card);
-
-    // Remember the newly drawn card
+    close_uno_window();
     m_has_drawn = true;
-    m_drawn_card = card;
-
-    // Announce draw without revealing card
-    Message drawn_message("DRAWN");
-    drawn_message.set("player", seat);
-    drawn_message.set("count", 1);
-    broadcast(move(drawn_message));
-
-    // Send updated hand privately
-    send_hand(seat);
+    m_drawn_card = m_players.at(seat).hand.back();
+    announce_draw(seat, 1);
     broadcast_turn();
-
     return true;
 }
 
 // Handle PASS command from a player
 bool HostSession::finish_draw_turn(int seat) {
+    if (m_waiting != WaitState::None) {
+        send_player_error(seat, "Resolve the challenge or swap first");
+        return false;
+    }
     // Verify that it is the player's turn
     if (seat != m_current_player) {
         send_player_error(seat, "Not your turn");
@@ -990,105 +1076,171 @@ Session::Result HostSession::pass(const Args&) {
     return Result::Continue;
 }
 
-// Handle UNO declaration from a player
+// The report window closes once the next player makes a legal move.
+void HostSession::close_uno_window() { m_uno_vulnerable = -1; }
+
+void HostSession::update_uno_window_after_play(int seat) {
+    m_uno_vulnerable = m_players.at(seat).hand.size() == 1 ? seat : -1;
+}
+
+void HostSession::announce_penalty(int seat) {
+    Message penalty("UNOPENALTY");
+    penalty.set("player", seat).set("count", 2);
+    out() << penalty.serialize() << '\n';
+    out().flush();
+    broadcast(move(penalty));
+    draw_many(seat, 2);
+    send_hand(seat);
+    if (m_uno_vulnerable == seat) close_uno_window();
+}
+
+// 'uno' can be called outside the player's turn, except during a forced window.
 void HostSession::handle_uno(int seat) {
-    // Check whether the player has exactly 1 card
+    if (m_waiting != WaitState::None) {
+        send_player_error(seat, "Resolve the challenge or swap first");
+        return;
+    }
     if (m_players.at(seat).hand.size() == 1) {
-        // Announce valid UNO declaration
-        Message uno_message("UNO");
-        uno_message.set("player", seat);
-
-        out() << uno_message.serialize() << '\n';
+        Message declared("UNO");
+        declared.set("player", seat);
+        out() << declared.serialize() << '\n';
         out().flush();
-
-        broadcast(move(uno_message));
-
+        broadcast(move(declared));
+        if (m_uno_vulnerable == seat) close_uno_window();
     } else {
-        // Penalize an incorrect UNO declaration
-        Message penalty("UNOPENALTY");
-        penalty.set("player", seat);
-        penalty.set("count", 2);
-
-        out() << penalty.serialize() << '\n';
-        out().flush();
-
-        broadcast(move(penalty));
-
-        // Make the player draw 2 penalty cards
-        for (int i = 0; i < 2 && m_next_card < m_deck.size(); ++i) {
-            m_players.at(seat).hand.push_back(m_deck[m_next_card]);
-           ++m_next_card;
-        }
-
-        // Send updated hand privately
-        send_hand(seat);
+        announce_penalty(seat);
     }
 }
 
- // Calculate the winner's score and end the game
-void HostSession::finish_game(int winner) {
-    // Calculate the total points of the losing players' cards
-    int points = 0;
-
-    for (const auto& [seat, player] : m_players) {
-        // Skip the winning player
-        if (seat == winner) {
-            continue;
-        }
-
-        // Add the point values of the remaining cards
-        for (const string& card : player.hand) {
-            points += card_points(card);
-        }
+bool HostSession::report_uno(int seat, const string& target) {
+    if (m_waiting != WaitState::None) {
+        send_player_error(seat, "Resolve the challenge or swap first");
+        return false;
     }
+    // Only a missed declaration on the latest play is reportable.
+    if (m_uno_vulnerable == -1 || target != to_string(m_uno_vulnerable) ||
+        seat == m_uno_vulnerable ||
+        m_players.at(m_uno_vulnerable).hand.size() != 1) {
+        send_player_error(seat, "No unreported UNO in the reporting window");
+        return false;
+    }
+    announce_penalty(m_uno_vulnerable);
+    return true;
+}
 
-    // Create GAMEOVER message
+// All hands rotate one seat in the current direction (0-card effect).
+void HostSession::cycle_hands() {
+    map<int, vector<string>> original;
+    for (const auto& [seat, player] : m_players) original[seat] = player.hand;
+    // Each player receives the hand of the previous seat in the current direction.
+    for (auto& [seat, player] : m_players)
+        player.hand = original.at(next_seat(seat, static_cast<int>(m_players.size()) - 1));
+    Message swap_message("SWAP");
+    swap_message.set("all", "yes");
+    out() << swap_message.serialize() << '\n';
+    out().flush();
+    broadcast(move(swap_message));
+    for (const auto& [seat, player] : m_players) send_hand(seat);
+    // A new hand with exactly one card needs its own UNO declaration.
+    m_uno_vulnerable = -1;
+    for (const auto& [seat, player] : m_players)
+        if (player.hand.size() == 1) m_uno_vulnerable = seat;
+}
+
+bool HostSession::resolve_swap(int seat, const string& target) {
+    if (m_waiting != WaitState::Swap || seat != m_waiting_player) {
+        send_player_error(seat, "No swap choice available for this player");
+        return false;
+    }
+    int other = -1;
+    for (const auto& [candidate, player] : m_players)
+        if (to_string(candidate) == target) other = candidate;
+    if (other < 0 || other == seat) {
+        send_player_error(seat, "Invalid swap target");
+        return false;
+    }
+    std::swap(m_players.at(seat).hand, m_players.at(other).hand);
+    m_waiting = WaitState::None;
+    m_waiting_player = -1;
+    Message done("SWAP");
+    done.set("player", seat).set("with", other);
+    out() << done.serialize() << '\n';
+    out().flush();
+    broadcast(move(done));
+    send_hand(seat);
+    send_hand(other);
+    m_uno_vulnerable = -1;
+    if (m_players.at(seat).hand.size() == 1) m_uno_vulnerable = seat;
+    if (m_players.at(other).hand.size() == 1) m_uno_vulnerable = other;
+    broadcast_turn();
+    return true;
+}
+
+bool HostSession::resolve_challenge(int seat, const string& accept) {
+    if (m_waiting != WaitState::Challenge || seat != m_waiting_player ||
+        (accept != "yes" && accept != "no")) {
+        send_player_error(seat, "No pending Wild Draw Four challenge for this player");
+        return false;
+    }
+    const bool caught = accept == "yes" && m_w4_illegal;
+    const int target = caught ? m_w4_player : seat;
+    const int count = caught ? 4 : (accept == "yes" ? 6 : 4);
+    m_waiting = WaitState::None;
+    m_waiting_player = -1;
+    m_pending_draw = 0;
+    m_chain_has_d2 = false;
+    Message verdict("CHALLENGE");
+    verdict.set("player", seat).set("accept", accept)
+           .set("result", caught ? "illegal" : (accept == "yes" ? "draw6" : "draw4"));
+    out() << verdict.serialize() << '\n';
+    out().flush();
+    broadcast(move(verdict));
+    draw_many(target, count);
+    send_hand(target);
+    m_current_player = caught ? seat : next_seat(seat);
+    m_w4_player = -1;
+    m_w4_illegal = false;
+    broadcast_turn();
+    return true;
+}
+
+// Calculate the winner's score and end the game.
+void HostSession::finish_game(int winner) {
+    int points = 0;
+    for (const auto& [seat, player] : m_players) {
+        if (seat == winner) continue;
+        for (const auto& card : player.hand) points += card_points(card);
+    }
     Message gameover("GAMEOVER");
-    gameover.set("winner", winner);
-    gameover.set("points", points);
-
-    // Display the result in the Host terminal
+    gameover.set("winner", winner).set("points", points);
     out() << gameover.serialize() << '\n';
     out().flush();
-
-    // Notify all connected clients
     broadcast(move(gameover));
-
-    // Reset game state
     m_pending_draw = 0;
+    m_chain_has_d2 = false;
+    m_waiting = WaitState::None;
+    m_waiting_player = -1;
+    m_uno_vulnerable = -1;
     m_has_drawn = false;
     m_drawn_card.clear();
-
-    // Return the Host to the lobby
     return_to_lobby();
 }
 
-
-// ============================================================================
-// 7. ADVANCED RULES (STAGE 3)
-// ============================================================================
-
-// Handle UNO command from the Host
 Session::Result HostSession::uno(const Args& args) {
-    if (args.size() > 1) {
-        error("UNO reporting is not implemented yet");
-        return Result::Continue;
-    }
-
-    handle_uno(0);
-
+    if (args.size() > 1) report_uno(0, args[1]);
+    else handle_uno(0);
     return Result::Continue;
 }
 
 Session::Result HostSession::challenge(const Args& args) {
     if (!valid_challenge_answer(args)) return Result::Continue;
-    info("TODO(host): resolve challenge answer=" + args[1]);
+    resolve_challenge(0, args[1]);
     return Result::Continue;
 }
 
 Session::Result HostSession::swap(const Args& args) {
-    info("TODO(host): swap hands with player " + args[1]);
+    resolve_swap(0, args[1]);
     return Result::Continue;
 }
 
-} // 命名空间 uno
+} // namespace uno
